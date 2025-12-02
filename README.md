@@ -10,6 +10,7 @@ To do:
 3. Fix bug of multiple duplicate textures.
 
 Note: Still work in progress, as always an initial version is on the public branch but the more up to date version with bugs is in the Dev branch.
+
 <img width="369" height="287" alt="image" src="https://github.com/user-attachments/assets/aa7e4481-926f-48ab-8268-c26b94311cf4" />
 <img width="1062" height="844" alt="image" src="https://github.com/user-attachments/assets/46581179-0dd6-4df7-976a-1e972ddb58ad" />
 <img width="2484" height="1477" alt="image" src="https://github.com/user-attachments/assets/bea31263-fa1c-43ac-ae1b-2b0ae360e742" />
