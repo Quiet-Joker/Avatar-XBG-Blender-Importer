@@ -450,9 +450,8 @@ class XBMMaterialData:
     def __init__(self):
         self.textures: Dict[str, str] = {}  # type -> path (e.g., 'diffuse' -> 'graphics/...')
         self.illumination_color: Optional[Tuple[float, float, float]] = None  # Normalized RGB
-        self.diffuse_tiling: float = 1.0
-        self.specular_tiling: float = 1.0
-        self.normal_tiling: float = 1.0
+        self.specular_color: Optional[Tuple[float, float, float]] = None  # Normalized RGB for SpecularColor1
+        self.tiling: float = 1.0  # Universal tiling value from DiffuseTiling1
 
 class XBMParser:
     """Parser for XBM material files"""
@@ -472,7 +471,10 @@ class XBMParser:
             # Extract IlluminationColor1
             XBMParser._extract_illumination_color(data, result)
             
-            # Extract tiling values
+            # Extract SpecularColor1
+            XBMParser._extract_specular_color(data, result)
+            
+            # Extract tiling value
             XBMParser._extract_tiling(data, result)
             
             # Look for missing textures in the same directory as found textures
@@ -489,6 +491,8 @@ class XBMParser:
         i = 0
         # Dictionary to track both mip0 and non-mip0 versions
         found_textures = {}  # tex_type -> {'mip0': path or None, 'regular': path or None}
+        # Track textures without type suffix (potential diffuse fallback)
+        unsuffixed_textures = {'mip0': None, 'regular': None}
         
         while i < len(data) - 20:
             # Look for graphics\ or graphics/ path patterns
@@ -530,9 +534,14 @@ class XBMParser:
                                 found_textures[tex_type]['regular'] = path
                                 print(f"  Found {tex_type}: {path}")
                         else:
-                            # Unknown type, store with path as key
-                            print(f"  Found unknown texture: {path}")
-                            result.textures[basename] = path
+                            # No recognized suffix - could be diffuse without _d marker
+                            # Store as potential diffuse fallback
+                            if is_mip0:
+                                unsuffixed_textures['mip0'] = path
+                                print(f"  Found unsuffixed texture (mip0): {path}")
+                            else:
+                                unsuffixed_textures['regular'] = path
+                                print(f"  Found unsuffixed texture: {path}")
                     
                     i = path_end + 1
                 else:
@@ -548,6 +557,15 @@ class XBMParser:
             elif versions['regular']:
                 result.textures[tex_type] = versions['regular']
                 print(f"  → Using regular version for {tex_type}")
+        
+        # If no diffuse texture was found but we have an unsuffixed texture, use it as diffuse
+        if 'diffuse' not in found_textures or (not found_textures['diffuse']['mip0'] and not found_textures['diffuse']['regular']):
+            if unsuffixed_textures['mip0']:
+                result.textures['diffuse'] = unsuffixed_textures['mip0']
+                print(f"  → Using unsuffixed mip0 texture as diffuse: {unsuffixed_textures['mip0']}")
+            elif unsuffixed_textures['regular']:
+                result.textures['diffuse'] = unsuffixed_textures['regular']
+                print(f"  → Using unsuffixed texture as diffuse: {unsuffixed_textures['regular']}")
 
     
     @staticmethod
@@ -583,31 +601,57 @@ class XBMParser:
                         pass
     
     @staticmethod
-    def _extract_tiling(data: bytes, result: XBMMaterialData):
-        """Extract tiling values for diffuse, specular, and normal maps"""
-        tiling_props = [
-            (b'DiffuseTiling1', 'diffuse_tiling'),
-            (b'SpecularTiling1', 'specular_tiling'),
-            (b'NormalTiling1', 'normal_tiling'),
-        ]
+    def _extract_specular_color(data: bytes, result: XBMMaterialData):
+        """Extract SpecularColor1 RGB values"""
+        # Look for SpecularColor1 string
+        search_terms = [b'SpecularColor1', b'specularcolor1']
         
-        for search_term, attr_name in tiling_props:
-            pos = data.find(search_term)
+        for term in search_terms:
+            pos = data.find(term)
             if pos != -1:
-                val_pos = pos + len(search_term)
+                # Value should be after the null terminator
+                val_pos = pos + len(term)
                 # Skip null terminators
                 while val_pos < len(data) and data[val_pos] == 0:
                     val_pos += 1
                 
-                # Read float value
-                if val_pos + 4 <= len(data):
+                # Read 3 floats (RGB)
+                if val_pos + 12 <= len(data):
                     try:
-                        value = struct.unpack('<f', data[val_pos:val_pos+4])[0]
-                        # Only set if it's a reasonable value
-                        if 0.001 < abs(value) < 1000:
-                            setattr(result, attr_name, value)
+                        r = struct.unpack('<f', data[val_pos:val_pos+4])[0]
+                        g = struct.unpack('<f', data[val_pos+4:val_pos+8])[0]
+                        b = struct.unpack('<f', data[val_pos+8:val_pos+12])[0]
+                        
+                        # Normalize HDR values to 0-1 range
+                        max_val = max(r, g, b, 1.0)
+                        if max_val > 0:
+                            result.specular_color = (r / max_val, g / max_val, b / max_val)
+                        else:
+                            result.specular_color = (0.0, 0.0, 0.0)
+                        return
                     except:
                         pass
+    
+    @staticmethod
+    def _extract_tiling(data: bytes, result: XBMMaterialData):
+        """Extract tiling value from DiffuseTiling1 (applies to ALL textures)"""
+        # Only look for DiffuseTiling1 - this value applies to all texture types
+        pos = data.find(b'DiffuseTiling1')
+        if pos != -1:
+            # The pattern is: PropertyName\x00 then 2 float values (X, Y tiling)
+            # Value starts after property name + 1 null byte
+            val_pos = pos + len(b'DiffuseTiling1') + 1
+            
+            # Read float value (4 bytes, little-endian)
+            if val_pos + 4 <= len(data):
+                try:
+                    value = struct.unpack('<f', data[val_pos:val_pos+4])[0]
+                    # Only set if it's a reasonable value (positive, not too large)
+                    if 0.001 < abs(value) < 1000:
+                        result.tiling = value
+                        print(f"  Found DiffuseTiling1 (applies to all textures): {value}")
+                except:
+                    pass
     
     @staticmethod
     def _find_missing_textures(result: XBMMaterialData, xbm_filepath: str, load_hd_textures: bool = True):
@@ -854,52 +898,48 @@ class BlenderMaterialSetup:
         tex_y_offset = 300
         
         # Check if we need tiling nodes
-        needs_tiling = (xbm_data.diffuse_tiling != 1.0 or 
-                       xbm_data.specular_tiling != 1.0 or 
-                       xbm_data.normal_tiling != 1.0)
+        needs_tiling = (xbm_data.tiling != 1.0)
         
         tex_coord = None
-        mapping_nodes = {}
+        mapping_node = None
+        
+        # Always create texture coordinate node
+        tex_coord = nodes.new('ShaderNodeTexCoord')
+        tex_coord.location = (-1200, 0)
         
         if needs_tiling:
-            # Create Texture Coordinate node
-            tex_coord = nodes.new('ShaderNodeTexCoord')
-            tex_coord.location = (-1200, 0)
-            
-            # Create mapping nodes for each tiling value
-            for tex_type, tiling in [('diffuse', xbm_data.diffuse_tiling),
-                                     ('specular', xbm_data.specular_tiling),
-                                     ('normal', xbm_data.normal_tiling)]:
-                if tiling != 1.0:
-                    mapping = nodes.new('ShaderNodeMapping')
-                    mapping.location = (-1000, tex_y_offset)
-                    mapping.inputs['Scale'].default_value = (tiling, tiling, 1.0)
-                    links.new(tex_coord.outputs['UV'], mapping.inputs['Vector'])
-                    mapping_nodes[tex_type] = mapping
-                    tex_y_offset -= 200
+            # Create a single mapping node for all textures
+            print(f"  Creating mapping node with tiling: {xbm_data.tiling}")
+            mapping_node = nodes.new('ShaderNodeMapping')
+            mapping_node.location = (-1000, 0)
+            mapping_node.inputs['Scale'].default_value = (xbm_data.tiling, xbm_data.tiling, 1.0)
+            links.new(tex_coord.outputs['UV'], mapping_node.inputs['Vector'])
+        else:
+            print(f"  No tiling needed, using direct UV coordinates")
         
         # Setup each texture type
         tex_y_offset = 300
         
-        # 1. Diffuse texture -> Base Color
+        # 1. Diffuse texture -> Base Color (with optional SpecularColor1 mix)
         if 'diffuse' in xbm_data.textures:
             tex_y_offset = BlenderMaterialSetup._setup_diffuse(
                 nodes, links, bsdf, xbm_data.textures['diffuse'], 
-                data_folder, mapping_nodes.get('diffuse'), tex_y_offset, load_hd_textures
+                data_folder, mapping_node, tex_y_offset, load_hd_textures, 
+                tex_coord, xbm_data.specular_color
             )
         
-        # 2. Specular texture -> IOR Level (non-color)
+        # 2. Specular texture -> IOR Level
         if 'specular' in xbm_data.textures:
             tex_y_offset = BlenderMaterialSetup._setup_specular(
                 nodes, links, bsdf, xbm_data.textures['specular'],
-                data_folder, mapping_nodes.get('specular'), tex_y_offset, load_hd_textures
+                data_folder, mapping_node, tex_y_offset, load_hd_textures, tex_coord
             )
         
         # 3. Normal map -> Special reconstruction setup
         if 'normal' in xbm_data.textures:
             tex_y_offset = BlenderMaterialSetup._setup_normal(
                 nodes, links, bsdf, xbm_data.textures['normal'],
-                data_folder, mapping_nodes.get('normal'), tex_y_offset, load_hd_textures
+                data_folder, mapping_node, tex_y_offset, load_hd_textures, tex_coord
             )
         
         # 4. Bio/Emission mask -> Emission with IlluminationColor1
@@ -983,18 +1023,75 @@ class BlenderMaterialSetup:
     
     @staticmethod
     def _setup_diffuse(nodes, links, bsdf, texture_path: str, data_folder: str,
-                      mapping_node: Optional[Any], y_offset: int, load_hd_textures: bool = True) -> int:
-        """Setup diffuse texture -> Base Color and Alpha"""
+                      mapping_node: Optional[Any], y_offset: int, load_hd_textures: bool = True, 
+                      tex_coord=None, specular_color: Optional[Tuple[float, float, float]] = None) -> int:
+        """Setup diffuse texture -> Base Color and Alpha
+        If specular_color is provided, mix diffuse with SpecularColor1 using Color blend mode
+        """
         tex_node = BlenderMaterialSetup._load_texture_node(
             nodes, texture_path, data_folder, (-600, y_offset), non_color=False, load_hd_textures=load_hd_textures
         )
         
         if tex_node:
+            # Connect UV coordinates (either from mapping node or directly from tex coord)
             if mapping_node:
                 links.new(mapping_node.outputs['Vector'], tex_node.inputs['Vector'])
+            elif tex_coord:
+                links.new(tex_coord.outputs['UV'], tex_node.inputs['Vector'])
             
-            # Connect color to base color
-            links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
+            # Check if we should mix with SpecularColor1
+            final_color_output = tex_node.outputs['Color']
+            
+            if specular_color:
+                r, g, b = specular_color
+                is_black = (abs(r) < 0.01 and abs(g) < 0.01 and abs(b) < 0.01)
+                is_white = (abs(r - 1.0) < 0.01 and abs(g - 1.0) < 0.01 and abs(b - 1.0) < 0.01)
+                
+                # Only create mix node if color is not black or white
+                if not (is_black or is_white):
+                    # Create Mix node with Color blend mode
+                    try:
+                        # Blender 3.4+
+                        mix_node = nodes.new('ShaderNodeMix')
+                        mix_node.data_type = 'RGBA'
+                        mix_node.blend_type = 'COLOR'
+                        mix_node.inputs['Factor'].default_value = 1.0
+                    except:
+                        # Older Blender
+                        mix_node = nodes.new('ShaderNodeMixRGB')
+                        mix_node.blend_type = 'COLOR'
+                        mix_node.inputs['Fac'].default_value = 1.0
+                    
+                    mix_node.location = (-300, y_offset)
+                    
+                    # Connect diffuse texture to A input
+                    if 'A' in mix_node.inputs:
+                        links.new(tex_node.outputs['Color'], mix_node.inputs['A'])
+                    elif 'Color1' in mix_node.inputs:
+                        links.new(tex_node.outputs['Color'], mix_node.inputs['Color1'])
+                    else:
+                        links.new(tex_node.outputs['Color'], mix_node.inputs[6])
+                    
+                    # Set B input to SpecularColor1
+                    if 'B' in mix_node.inputs:
+                        mix_node.inputs['B'].default_value = (*specular_color, 1.0)
+                    elif 'Color2' in mix_node.inputs:
+                        mix_node.inputs['Color2'].default_value = (*specular_color, 1.0)
+                    else:
+                        mix_node.inputs[7].default_value = (*specular_color, 1.0)
+                    
+                    # Use mix output as final color
+                    if 'Result' in mix_node.outputs:
+                        final_color_output = mix_node.outputs['Result']
+                    elif 'Color' in mix_node.outputs:
+                        final_color_output = mix_node.outputs['Color']
+                    else:
+                        final_color_output = mix_node.outputs[0]
+                    
+                    print(f"  Diffuse with SpecularColor1 mix: RGB({r:.3f}, {g:.3f}, {b:.3f})")
+            
+            # Connect final color to base color
+            links.new(final_color_output, bsdf.inputs['Base Color'])
             
             # Always connect alpha to BSDF alpha
             links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
@@ -1002,16 +1099,21 @@ class BlenderMaterialSetup:
         return y_offset - 300
     
     @staticmethod
-    def _setup_specular(nodes, links, bsdf, texture_path: str, data_folder: str,
-                       mapping_node: Optional[Any], y_offset: int, load_hd_textures: bool = True) -> int:
-        """Setup specular texture -> IOR Level (non-color)"""
+    def _setup_specular(nodes, links, bsdf, texture_path: str,
+                       data_folder: str, mapping_node: Optional[Any], y_offset: int, 
+                       load_hd_textures: bool = True, tex_coord=None) -> int:
+        """Setup specular texture -> IOR Level (Specular in older Blender versions)"""
         tex_node = BlenderMaterialSetup._load_texture_node(
             nodes, texture_path, data_folder, (-600, y_offset), non_color=True, load_hd_textures=load_hd_textures
         )
         
         if tex_node:
+            # Connect UV coordinates (either from mapping node or directly from tex coord)
             if mapping_node:
                 links.new(mapping_node.outputs['Vector'], tex_node.inputs['Vector'])
+            elif tex_coord:
+                links.new(tex_coord.outputs['UV'], tex_node.inputs['Vector'])
+            
             # Connect to IOR Level (Specular in older Blender versions)
             if 'IOR Level' in bsdf.inputs:
                 links.new(tex_node.outputs['Color'], bsdf.inputs['IOR Level'])
@@ -1024,7 +1126,7 @@ class BlenderMaterialSetup:
     
     @staticmethod
     def _setup_normal(nodes, links, bsdf, texture_path: str, data_folder: str,
-                     mapping_node: Optional[Any], y_offset: int, load_hd_textures: bool = True) -> int:
+                     mapping_node: Optional[Any], y_offset: int, load_hd_textures: bool = True, tex_coord=None) -> int:
         """Setup normal map with Avatar's special reconstruction:
         - Texture Color output -> Combine Color Green channel
         - Texture Alpha output -> Combine Color Red channel  
@@ -1036,8 +1138,11 @@ class BlenderMaterialSetup:
         )
         
         if tex_node:
+            # Connect UV coordinates (either from mapping node or directly from tex coord)
             if mapping_node:
                 links.new(mapping_node.outputs['Vector'], tex_node.inputs['Vector'])
+            elif tex_coord:
+                links.new(tex_coord.outputs['UV'], tex_node.inputs['Vector'])
             
             # Create Combine Color node (or Combine RGB for older Blender)
             try:
@@ -1276,7 +1381,7 @@ class XBGBlenderImporter:
             bl_materials = []
             # Map material index to blender material index (0, 1, 2...)
             mat_mapping = {} 
-            # Track materials for texture loading
+            # Track materials for texture loading (only if not already setup)
             materials_to_setup = []
             
             for prim in mesh.primitives:
@@ -1287,17 +1392,27 @@ class XBGBlenderImporter:
                     if not mat_real_name and mat_idx < len(material_names):
                         mat_real_name = material_names[mat_idx]
                     
-                    # Check if exists
+                    # Check if material already exists
                     mat = bpy.data.materials.get(mat_real_name)
-                    if not mat:
+                    material_already_setup = False
+                    
+                    if mat:
+                        # Material exists - check if it already has texture setup
+                        # by checking if it has nodes beyond just BSDF and output
+                        if mat.use_nodes and len(mat.node_tree.nodes) > 2:
+                            material_already_setup = True
+                            print(f"Reusing existing material with textures: {mat_real_name}")
+                    else:
+                        # Create new material
                         mat = bpy.data.materials.new(name=mat_real_name)
                         mat.use_nodes = True
                     
                     obj.data.materials.append(mat)
                     mat_mapping[mat_idx] = len(obj.data.materials) - 1
                     
-                    # Store material info for texture loading
-                    materials_to_setup.append((mat, mat_real_name))
+                    # Only add to setup list if material needs texture setup
+                    if not material_already_setup:
+                        materials_to_setup.append((mat, mat_real_name))
                 
                 bl_mat_index = mat_mapping[mat_idx]
                 
